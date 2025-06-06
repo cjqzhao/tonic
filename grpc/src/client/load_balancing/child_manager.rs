@@ -111,12 +111,13 @@ impl<T: ChildIdentifier> ChildManager<T> {
         }
         // Update the tracked state if the child produced an update.
         if let Some(state) = channel_controller.picker_update {
-            self.children[child_idx].state = state;
+            self.children.get_mut(&child_id.clone()).unwrap().state = state;
+            self.updated = true;
         };
     }
 }
 
-impl<T: PartialEq + Hash + Eq + Send + Sync + 'static> LbPolicy for ChildManager<T> {
+impl<T: ChildIdentifier> LbPolicy for ChildManager<T> {
     fn resolver_update(
         &mut self,
         resolver_update: ResolverUpdate,
@@ -249,13 +250,16 @@ impl<T: PartialEq + Hash + Eq + Send + Sync + 'static> LbPolicy for ChildManager
     }
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        let child_idxes = mem::take(&mut *self.pending_work.lock().unwrap());
-        for child_idx in child_idxes {
-            let mut channel_controller = WrappedController::new(channel_controller);
-            self.children[child_idx]
-                .policy
-                .work(&mut channel_controller);
-            self.resolve_child_controller(channel_controller, child_idx);
+        let children = mem::take(&mut *self.work_requests.lock().unwrap());
+        // It is possible that work was queued for a child that got removed as
+        // part of a subsequent resolver_update. So, it is safe to ignore such a
+        // child here.
+        for child_id in children {
+            if let Some(child) = self.children.get_mut(&child_id) {
+                let mut channel_controller = WrappedController::new(channel_controller);
+                child.policy.work(&mut channel_controller);
+                self.resolve_child_controller(channel_controller, child_id.clone());
+            }
         }
     }
 }
