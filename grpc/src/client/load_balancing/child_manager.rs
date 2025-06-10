@@ -28,12 +28,17 @@ use std::sync::Mutex;
 use std::{collections::HashMap, error::Error, hash::Hash, mem, sync::Arc};
 
 use crate::client::load_balancing::{
-    ChannelController, LbConfig, LbPolicy, LbPolicyBuilder, LbPolicyOptions, LbState,
-    WeakSubchannel, WorkScheduler,
+    ChannelController, ExternalSubchannel, Failing, LbConfig, LbPolicy, LbPolicyBuilder,
+    LbPolicyOptions, LbState, ParsedJsonLbConfig, PickResult, Picker, QueuingPicker,
+    Subchannel, SubchannelState, WeakSubchannel, WorkScheduler, GLOBAL_LB_REGISTRY, ConnectivityState,
 };
 use crate::client::name_resolution::{Address, ResolverUpdate};
+use crate::service::{Message, Request, Response, Service};
 
-use super::{Subchannel, SubchannelState};
+use tonic::{metadata::MetadataMap, Status};
+
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::{AbortHandle, JoinHandle};
 
 // An LbPolicy implementation that manages multiple children.
 pub struct ChildManager<T> {
@@ -41,7 +46,15 @@ pub struct ChildManager<T> {
     children: Vec<Child<T>>,
     update_sharder: Box<dyn ResolverUpdateSharder<T>>,
     pending_work: Arc<Mutex<HashSet<usize>>>,
+    updated: bool, // true iff a child has updated its state since the last call to has_updated.
+    // work_requests: Arc<Mutex<HashSet<Arc<T>>>>,
+    // work_scheduler: Arc<dyn WorkScheduler>,
+    sent_connecting_state: bool,
+    aggregated_state: ConnectivityState,
+    
 }
+
+use std::{sync::{atomic::{AtomicUsize, Ordering}}};
 
 pub trait ChildIdentifier: PartialEq + Hash + Eq + Send + Sync + 'static {}
 
@@ -77,12 +90,17 @@ pub trait ResolverUpdateSharder<T: ChildIdentifier>: Send {
 impl<T: ChildIdentifier> ChildManager<T> {
     /// Creates a new ChildManager LB policy.  shard_update is called whenever a
     /// resolver_update operation occurs.
-    pub fn new(update_sharder: Box<dyn ResolverUpdateSharder<T>>) -> Self {
-        Self {
+    pub fn new(
+        update_sharder: Box<dyn ResolverUpdateSharder<T>>
+    ) -> Self {
+        ChildManager {
             update_sharder,
             subchannel_child_map: Default::default(),
             children: Default::default(),
             pending_work: Default::default(),
+            updated: false,
+            sent_connecting_state: false,
+            aggregated_state: ConnectivityState::Idle,
         }
     }
 
@@ -93,6 +111,8 @@ impl<T: ChildIdentifier> ChildManager<T> {
             .map(|child| (&child.identifier, &child.state))
     }
 
+
+
     // Called to update all accounting in the ChildManager from operations
     // performed by a child policy on the WrappedController that was created for
     // it.  child_idx is an index into the children map for the relevant child.
@@ -102,7 +122,9 @@ impl<T: ChildIdentifier> ChildManager<T> {
     // which way is better.
     fn resolve_child_controller(
         &mut self,
-        channel_controller: WrappedController,
+        is_updating_subchannel: bool,
+        channel_controller: &mut WrappedController,
+        
         child_idx: usize,
     ) {
         // Add all created subchannels into the subchannel_child_map.
@@ -111,9 +133,16 @@ impl<T: ChildIdentifier> ChildManager<T> {
         }
         // Update the tracked state if the child produced an update.
         if let Some(state) = channel_controller.picker_update {
-            self.children.get_mut(&child_id.clone()).unwrap().state = state;
+            self.children[child_idx].state = state;
             self.updated = true;
         };
+        // Update the tracked state if the child produced an update.
+        // if let Some(state) = channel_controller.picker_update.clone() {
+        //     self.children.get_mut(&child_id.clone()).unwrap().state = state;
+        //     self.updated = true;
+        // };
+        // Prune subchannels created by this child that are no longer
+        // referenced.
     }
 }
 
@@ -125,107 +154,42 @@ impl<T: ChildIdentifier> LbPolicy for ChildManager<T> {
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // First determine if the incoming update is valid.
-        let child_updates = self.update_sharder.shard_update(resolver_update)?;
+        let child_updates = self.sharder.shard_update(resolver_update)?;
 
-        // Hold the lock to prevent new work requests during this operation and
-        // rewrite the indices.
-        let mut pending_work = self.pending_work.lock().unwrap();
+        // Remove children that are no longer active.
+        self.children
+            .retain(|child_id, _| child_updates.contains_key(child_id));
 
-        // Reset pending work; we will re-add any entries it contains with the
-        // right index later.
-        let old_pending_work = mem::take(&mut *pending_work);
-
-        // Replace self.children with an empty vec.
-        let old_children = mem::take(&mut self.children);
-
-        // Replace the subchannel map with an empty map.
-        let old_subchannel_child_map = mem::take(&mut self.subchannel_child_map);
-
-        // Reverse the old subchannel map.
-        let mut old_child_subchannels_map: HashMap<usize, Vec<WeakSubchannel>> = HashMap::new();
-
-        for (subchannel, child_idx) in old_subchannel_child_map {
-            old_child_subchannels_map
-                .entry(child_idx)
-                .or_default()
-                .push(subchannel);
-        }
-
-        // Build a map of the old children from their IDs for efficient lookups.
-        let old_children = old_children
-            .into_iter()
-            .enumerate()
-            .map(|(old_idx, e)| (e.identifier, (e.policy, e.state, old_idx, e.work_scheduler)));
-        let mut old_children: HashMap<T, _> = old_children.collect();
-
-        // Split the child updates into the IDs and builders, and the
-        // ResolverUpdates.
-        let (ids_builders, updates): (Vec<_>, Vec<_>) = child_updates
-            .map(|e| ((e.child_identifier, e.child_policy_builder), e.child_update))
-            .unzip();
-
-        // Transfer children whose identifiers appear before and after the
-        // update, and create new children.  Add entries back into the
-        // subchannel map.
-        for (new_idx, (identifier, builder)) in ids_builders.into_iter().enumerate() {
-            if let Some((policy, state, old_idx, work_scheduler)) = old_children.remove(&identifier)
-            {
-                for subchannel in old_child_subchannels_map
-                    .remove(&old_idx)
-                    .into_iter()
-                    .flatten()
-                {
-                    self.subchannel_child_map.insert(subchannel, new_idx);
+        // Apply child updates to respective policies, instantiating new ones as
+        // needed.
+        for (id, update) in child_updates.into_iter() {
+            let child_id: Arc<T> = Arc::new(id);
+            let child_policy: &mut dyn LbPolicy = match self.children.get_mut(&child_id) {
+                Some(child) => child.policy.as_mut(),
+                None => {
+                    self.children.insert(
+                        child_id.clone(),
+                        Child {
+                            policy: update.child_policy_builder.build(LbPolicyOptions {
+                                work_scheduler: Arc::new(ChildScheduler::new(
+                                    child_id.clone(),
+                                    self.work_scheduler.clone(),
+                                    self.work_requests.clone(),
+                                )),
+                            }),
+                            state: LbState::initial(),
+                        },
+                    );
+                    self.children.get_mut(&child_id).unwrap().policy.as_mut()
                 }
-                if old_pending_work.contains(&old_idx) {
-                    pending_work.insert(new_idx);
-                }
-                *work_scheduler.idx.lock().unwrap() = Some(new_idx);
-                self.children.push(Child {
-                    identifier,
-                    state,
-                    policy,
-                    work_scheduler,
-                });
-            } else {
-                let work_scheduler = Arc::new(ChildWorkScheduler {
-                    pending_work: self.pending_work.clone(),
-                    idx: Mutex::new(Some(new_idx)),
-                });
-                let policy = builder.build(LbPolicyOptions {
-                    work_scheduler: work_scheduler.clone(),
-                });
-                let state = LbState::initial();
-                self.children.push(Child {
-                    identifier,
-                    state,
-                    policy,
-                    work_scheduler,
-                });
             };
-        }
-
-        // Invalidate all deleted children's work_schedulers.
-        for (_, (_, _, _, work_scheduler)) in old_children {
-            *work_scheduler.idx.lock().unwrap() = None;
-        }
-
-        // Release the pending_work mutex before calling into the children to
-        // allow their work scheduler calls to unblock.
-        drop(pending_work);
-
-        // Anything left in old_children will just be Dropped and cleaned up.
-
-        // Call resolver_update on all children.
-        let mut updates = updates.into_iter();
-        for child_idx in 0..self.children.len() {
-            let child = &mut self.children[child_idx];
-            let child_update = updates.next().unwrap();
             let mut channel_controller = WrappedController::new(channel_controller);
-            let _ = child
-                .policy
-                .resolver_update(child_update, config, &mut channel_controller);
-            self.resolve_child_controller(channel_controller, child_idx);
+            let _ = child_policy.resolver_update(
+                update.child_update.clone(),
+                config,
+                &mut channel_controller,
+            );
+            self.resolve_child_controller(channel_controller, child_id.clone());
         }
         Ok(())
     }
@@ -246,7 +210,7 @@ impl<T: ChildIdentifier> LbPolicy for ChildManager<T> {
         let mut channel_controller = WrappedController::new(channel_controller);
         // Call the proper child.
         policy.subchannel_update(subchannel, state, &mut channel_controller);
-        self.resolve_child_controller(channel_controller, child_idx);
+        self.resolve_child_controller(channel_controller, child_id.clone());
     }
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
@@ -258,7 +222,7 @@ impl<T: ChildIdentifier> LbPolicy for ChildManager<T> {
             if let Some(child) = self.children.get_mut(&child_id) {
                 let mut channel_controller = WrappedController::new(channel_controller);
                 child.policy.work(&mut channel_controller);
-                self.resolve_child_controller(channel_controller, child_id.clone());
+                self.resolve_child_controller(false, &mut channel_controller, child_id.clone());
             }
         }
     }
@@ -288,8 +252,9 @@ impl ChannelController for WrappedController<'_> {
     }
 
     fn update_picker(&mut self, update: LbState) {
-        self.picker_update = Some(update);
-    }
+            self.picker_update = Some(update.clone());
+            self.channel_controller.update_picker(update);
+        }
 
     fn request_resolution(&mut self) {
         self.channel_controller.request_resolution();
@@ -307,5 +272,117 @@ impl WorkScheduler for ChildWorkScheduler {
         if let Some(idx) = *self.idx.lock().unwrap() {
             pending_work.insert(idx);
         }
+    }
+}
+
+struct ReadyPickers {
+    pickers: Vec<Arc<dyn Picker>>,
+    next: AtomicUsize,
+}
+
+
+
+impl ReadyPickers {
+    pub fn new() -> Self {
+        Self {
+            pickers: vec![],
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn add_picker(&mut self, picker: Arc<dyn Picker>)  {
+        self.pickers.push(picker);
+    }
+
+    pub fn has_any(&self) -> bool {
+        !self.pickers.is_empty()
+    }
+}
+
+impl Picker for ReadyPickers {
+    fn pick(&self, request: &Request) -> PickResult {
+        let len = self.pickers.len();
+        if len == 0 {
+            return PickResult::Queue;
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % len;
+        self.pickers[idx].pick(request)
+    }
+
+    
+}
+struct ConnectingPickers {
+    pickers: Vec<Arc<dyn Picker>>,
+    // next: AtomicUsize,
+}
+
+impl Picker for ConnectingPickers {
+    fn pick(&self, request: &Request) -> PickResult {
+        
+        return PickResult::Queue;
+        
+    }
+}
+
+impl ConnectingPickers {
+    pub fn new() -> Self {
+        Self {
+            pickers: vec![],
+        }
+    }
+
+    fn add_picker(&mut self, picker: Arc<dyn Picker>)  {
+        self.pickers.push(picker);
+    }
+}
+
+struct TransientFailurePickers {
+    pickers: Vec<Arc<dyn Picker>>,
+    error: String,    
+
+}
+
+impl Picker for TransientFailurePickers {
+    fn pick(&self, request: &Request) -> PickResult {
+        
+        return PickResult::Fail(Status::unavailable(self.error.clone()))
+        
+    }
+}
+
+impl TransientFailurePickers {
+    pub fn new(error: String) -> Self {
+        Self {
+            pickers: vec![],
+            error,
+        }
+    }
+
+    fn add_picker(&mut self, picker: Arc<dyn Picker>)  {
+        self.pickers.push(picker);
+    }
+}
+struct IdlePickers {
+    pickers: Vec<Arc<dyn Picker>>,
+    // next: AtomicUsize,
+}
+
+impl Picker for IdlePickers {
+    fn pick(&self, request: &Request) -> PickResult {
+        
+        return PickResult::Queue;
+        
+    }
+}
+
+impl IdlePickers {
+    pub fn new() -> Self {
+        Self {
+            pickers: vec![],
+        }
+    }
+
+    fn add_picker(&mut self, picker: Arc<dyn Picker>)  {
+        self.pickers.push(picker);
     }
 }
