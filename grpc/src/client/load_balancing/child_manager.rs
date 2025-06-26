@@ -1,3 +1,4 @@
+
 /*
  *
  * Copyright 2025 gRPC authors.
@@ -29,9 +30,7 @@ use std::sync::Mutex;
 use std::{collections::HashMap, error::Error, hash::Hash, mem, sync::Arc};
 
 use crate::client::load_balancing::{
-    ChannelController, ExternalSubchannel, Failing, LbConfig, LbPolicy, LbPolicyBuilder,
-    LbPolicyOptions, LbState, ParsedJsonLbConfig, PickResult, Picker, QueuingPicker,
-    Subchannel, SubchannelState, WeakSubchannel, WorkScheduler, GLOBAL_LB_REGISTRY, ConnectivityState,
+    ChannelController, ConnectivityState, ExternalSubchannel, Failing, LbConfig, LbPolicy, LbPolicyBuilder, LbPolicyOptions, LbState, ParsedJsonLbConfig, PickResult, Picker, QueuingPicker, Subchannel, SubchannelState, WeakSubchannel, WeakSubchannelMap, WorkScheduler, GLOBAL_LB_REGISTRY
 };
 use crate::client::name_resolution::{Address, ResolverUpdate};
 use crate::service::{Message, Request, Response, Service};
@@ -158,15 +157,19 @@ impl<T: ChildIdentifier> ChildManager<T> {
         
 
     }
-
+    // Called to aggregate states from pick first children. Sends a picker to
+    // the channel based on aggregation
     fn aggregate_states (& mut self, channel_controller: &mut WrappedController) {
         let current_connectivity_state = self.aggregated_state.clone();
         let child_states_vec: Vec<_> = self.child_states().collect();
+        // Constructing pickers to return
         let mut transient_failure_picker = TransientFailurePickers::new("error string I guess".to_string());
         let mut connecting_pickers = ConnectingPickers::new();
         let mut ready_pickers = ReadyPickers::new();
+
         let mut has_idle = false;
         let mut is_transient_failure = true;
+
         for (child_id, state) in &child_states_vec {
             match state.connectivity_state {
                 ConnectivityState::Idle => {
@@ -185,8 +188,6 @@ impl<T: ChildIdentifier> ChildManager<T> {
                 ConnectivityState::TransientFailure =>{
                     transient_failure_picker.add_picker(state.picker.clone());
                 }
-                
-               
             }
         }
 
@@ -204,8 +205,8 @@ impl<T: ChildIdentifier> ChildManager<T> {
         } else{
             ConnectivityState::Connecting
         };
+
         self.aggregated_state = new_state;
-        println!("new state is {}", new_state);
 
        
 
@@ -216,10 +217,7 @@ impl<T: ChildIdentifier> ChildManager<T> {
                 let picker: Arc<dyn Picker> = Arc::new(ready_pickers);
                 let should_update = !self.compare_prev_to_new_pickers(&self.last_ready_pickers, &pickers_vec);
 
-                // let should_update = match &self.picker {
-                //     Some(existing_picker) => !Arc::ptr_eq(existing_picker, &picker),
-                //     None => true,
-                // };
+              
                 if should_update || self.aggregated_state != ConnectivityState::Ready {
                     println!("child manager sends ready picker update");
                     self.aggregated_state = ConnectivityState::Ready;
