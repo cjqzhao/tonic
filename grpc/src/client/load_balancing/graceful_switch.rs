@@ -42,26 +42,7 @@ pub static POLICY_NAME: &str = "round_robin";
 #[cfg(test)]
 mod test;
 
-// impl WorkScheduler for GracefulSwitchPolicy {
-//     fn schedule_work(&self) {
-//         if mem::replace(&mut *self.pending.lock().unwrap(), true) {
-//             // Already had a pending call scheduled.
-//             return;
-//         }
-//         let _ = self.work_scheduler.send(WorkQueueItem::Closure(Box::new(
-//             |c: &mut InternalChannelController| {
-//                 *c.lb.pending.lock().unwrap() = false;
-//                 c.lb.clone()
-//                     .policy
-//                     .lock()
-//                     .unwrap()
-//                     .as_mut()
-//                     .unwrap()
-//                     .work(c);
-//             },
-//         )));
-//     }
-// }
+
 
 #[derive(Deserialize)]
 pub(super) struct GracefulSwitchConfig {
@@ -88,13 +69,10 @@ struct for round_robin
 struct GracefulSwitchPolicy {
     // mutex: Mutex<Arc<dyn LbPolicy>>,
     // current_mutex: Mutex<Arc<dyn LbPolicy>>,
-    current_policy_builder: Mutex<Option<Arc<dyn LbPolicyBuilder>>>,
-    pending_policy_builder: Mutex<Option<Arc<dyn LbPolicyBuilder>>>,
+    // current_policy_builder: Mutex<Option<Arc<dyn LbPolicyBuilder>>>,
+    // pending_policy_builder: Mutex<Option<Arc<dyn LbPolicyBuilder>>>,
     subchannel_to_policy: HashMap<WeakSubchannel, ChildKind>,
-    current_policy: Mutex<Option<Box<dyn LbPolicy>>>,
-    pending_policy: Mutex<Option<Box<dyn LbPolicy>>>,
-    current_policy_state: Mutex<Option<ConnectivityState>>,
-    pending_policy_state: Mutex<Option<ConnectivityState>>,
+    managing_policy: Mutex<LatestPolicy>,
     closed: bool,
     work_scheduler: Arc<dyn WorkScheduler>,
     pending: bool,
@@ -117,84 +95,48 @@ impl LbPolicy for GracefulSwitchPolicy{
         };
         let new_builder_name = cfg.child_builder.name();
 
-        // Get the latest builder name (pending if exists, else current)
-        let mut latest_builder_name = "none";
-        if let Some(pending) = self.pending_policy_builder.lock().unwrap().as_ref() {
-            latest_builder_name = pending.name();
-        } else if let Some(current) = self.current_policy_builder.lock().unwrap().as_ref() {
-            latest_builder_name = current.name();
-        } else {
-            latest_builder_name = "";
-        };
-        let mut child_kind_to_update = self.latest_balancer();
-        // Determine which policy to update and whether it is None, but drop the lock before further mutable borrows.
-        let (policy_to_update_none, child_kind_to_update_copy) = {
-            let policy_to_update = match child_kind_to_update {
-                ChildKind::Current => &self.current_policy,
-                ChildKind::Pending => &self.pending_policy,
-            };
-            let is_none = {
-                let current_policy = policy_to_update.lock().unwrap();
-                current_policy.is_none()
-            };
-            (is_none, child_kind_to_update.clone())
-        };
+        let mut managing_policy_guard = self.managing_policy.lock().unwrap();
+
+        // Determine which child policy is currently "active" and its name
+        let last_policy = managing_policy_guard.latest_balancer_name();
 
         let mut wrapped_channel_controller = WrappedController::new(channel_controller);
         let update_clone = update.clone();
+        let mut target_child_kind = ChildKind::Pending;
 
-        if policy_to_update_none || latest_builder_name != new_builder_name{
-            let child_kind = self.switch_to(update, config, child_kind_to_update.clone());
-            child_kind_to_update = child_kind;
+        if managing_policy_guard.no_policy() || last_policy != new_builder_name {            
+            drop(managing_policy_guard);
+            target_child_kind = self.switch_to(config);
+            
+            managing_policy_guard = self.managing_policy.lock().unwrap();
         }
-        let actual_child_to_update = child_kind_to_update.clone();
-
-        if let Some(pending) = self.pending_policy_builder.lock().unwrap().as_ref() {
-            println!("pending policy is {}", pending.name());
-        }
-        if let Some(current) = self.current_policy_builder.lock().unwrap().as_ref() {
-            println!("current policy is {}", current.name());
-        }
-
-        {
-            let policy_to_update = match actual_child_to_update {
-                ChildKind::Current => &self.current_policy,
-                ChildKind::Pending => &self.pending_policy,
-            };
-            let state_to_update = match actual_child_to_update {
-                ChildKind::Current => &self.current_policy_state,
-                ChildKind::Pending => &self.pending_policy_state,
-            };
-            println!("Sending resolver_update to {:?}", actual_child_to_update);
-            if let Some(ref mut policy) = *policy_to_update.lock().unwrap() {
-                policy.resolver_update(update_clone, cfg.child_config.as_ref(), &mut wrapped_channel_controller)?;
-            }
-            let picker_update = wrapped_channel_controller.picker_update.clone();
-            if let Some(picker) = picker_update {
-                *state_to_update.lock().unwrap() = Some(picker.connectivity_state);
-            }
-        }
-        let current_state = self.current_policy_state.lock().unwrap().clone();
-        let pending_state = self.pending_policy_state.lock().unwrap().clone();
-        let mut should_swap = false;
-        match (current_state, pending_state) {
-            (Some(curr), Some(pend)) => {
-                if curr != ConnectivityState::Ready || pend != ConnectivityState::Connecting {
-                    println!("should swap");
-                    should_swap = true;
+        match target_child_kind {
+            ChildKind::Current => {
+                if let Some(ref mut current_policy_instance) = managing_policy_guard.current_child.policy {
+                    current_policy_instance.resolver_update(update_clone, cfg.child_config.as_ref(), &mut wrapped_channel_controller)?;
+                    if let Some(picker) = wrapped_channel_controller.picker_update.take() {
+                        managing_policy_guard.current_child.policy_state = Some(picker.connectivity_state);
+                        println!("sending picker of current child");
+                        wrapped_channel_controller.channel_controller.update_picker(picker);
+                    }
+                   
                 }
             }
-        _ => {
-            should_swap = false;
+            ChildKind::Pending => {
+                println!("Sending resolver_update to Pending Child Policy.");
+                if let Some(ref mut pending_policy_instance) = managing_policy_guard.pending_child.policy {
+                    pending_policy_instance.resolver_update(update_clone, cfg.child_config.as_ref(), &mut wrapped_channel_controller)?;
+                    if let Some(picker) = wrapped_channel_controller.picker_update.take() {
+                        managing_policy_guard.pending_child.policy_state = Some(picker.connectivity_state);
+                        managing_policy_guard.current_child.policy_picker_update = Some(picker)
+                    }
+                }
             }
         }
 
-        if should_swap {
-            println!("swapping");
-            self.swap();
-        }
-       
-        self.resolve_child_controller(&mut wrapped_channel_controller, child_kind_to_update);
+        drop(managing_policy_guard);
+        self.resolve_child_controller(&mut wrapped_channel_controller, target_child_kind);
+
         Ok(())
     }
 
@@ -214,79 +156,70 @@ impl LbPolicy for GracefulSwitchPolicy{
         // let current_policy_state = 
         
 
+        let mut managing_policy = self.managing_policy.lock().unwrap();
+
         match which_child {
             ChildKind::Pending => {
-                println!("sending subchannel update to pending kid");
-                if let Some(ref mut pending_policy) = *self.pending_policy.lock().unwrap() {
-                    pending_policy.subchannel_update(subchannel, state, &mut wrapped_channel_controller);
-                    let picker_update = wrapped_channel_controller.picker_update.clone();
-                    if let Some(picker) = picker_update {
-                        *self.pending_policy_state.lock().unwrap() = Some(picker.connectivity_state);
+                if let Some(ref mut pending_policy_instance) = managing_policy.pending_child.policy {
+                    pending_policy_instance.subchannel_update(subchannel, state, &mut wrapped_channel_controller);
+                    if let Some(picker) = wrapped_channel_controller.picker_update.take() {
+                        managing_policy.pending_child.policy_state = Some(picker.connectivity_state);
+                        managing_policy.pending_child.policy_picker_update = Some(picker)
                     }
-                   
                 }
             }
             ChildKind::Current => {
-                println!("sending subchannel update to current kid");
-                if let Some(ref mut current_policy) = *self.current_policy.lock().unwrap() {
-                    
-                    current_policy.subchannel_update(subchannel, state, &mut wrapped_channel_controller);
-                    let picker_update = wrapped_channel_controller.picker_update.clone();
-                    if let Some(picker) = picker_update {
-                        *self.current_policy_state.lock().unwrap() = Some(picker.connectivity_state);
+                if let Some(ref mut current_policy_instance) = managing_policy.current_child.policy {
+                    current_policy_instance.subchannel_update(subchannel, state, &mut wrapped_channel_controller);
+                    if let Some(picker) = wrapped_channel_controller.picker_update.take() {
+                        managing_policy.current_child.policy_state = Some(picker.connectivity_state);
+                        wrapped_channel_controller.channel_controller.update_picker(picker);
+                        
                     }
-
                 }
             }
         }
 
-        let current_state = self.current_policy_state.lock().unwrap().clone();
-        let pending_state = self.pending_policy_state.lock().unwrap().clone();
+        // Drop the lock on managing_policy before calling resolve_child_controller
+        // as resolve_child_controller also tries to acquire this lock.
+        drop(managing_policy);
 
-        
-        let mut should_swap = false;
-        match (current_state, pending_state) {
-            (Some(curr), Some(pend)) => {
-                if curr != ConnectivityState::Ready || pend != ConnectivityState::Connecting {
-                    println!("should swap");
-                    should_swap = true;
-                }
-            }
-        _ => {
-            should_swap = false;
-        }
-    }
-
-        if should_swap {
-            println!("swapping");
-            // Promote pending to current
-            self.swap();
-            // Optionally clear subchannel_to_policy for old current, etc.
-        }
-        if let Some(pending) = self.pending_policy_builder.lock().unwrap().as_ref() {
-            println!("pending policy is {}", pending.name());
-        }
-        if let Some(current) = self.current_policy_builder.lock().unwrap().as_ref() {
-            println!("current policy is {}", current.name());
-        }
-
-    // self.resolve_child_controller(&mut wrapped_channel_controller, which_child);
+        // This call will now check the states and potentially swap.
         self.resolve_child_controller(&mut wrapped_channel_controller, which_child);
     }
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        if let Some(ref mut pending_policy) = *self.pending_policy.lock().unwrap() {
-            pending_policy.work(channel_controller);
-        } else if let Some(ref mut current_policy) = *self.current_policy.lock().unwrap() {
-            current_policy.work(channel_controller);
+        let mut managing_policy = self.managing_policy.lock().unwrap();
+        let mut wrapped_channel_controller = WrappedController::new(channel_controller);
+
+        if let Some(ref mut pending_policy_instance) = managing_policy.pending_child.policy {
+            pending_policy_instance.work(&mut wrapped_channel_controller);
+            drop(managing_policy);
+            self.resolve_child_controller(&mut wrapped_channel_controller, ChildKind::Pending);
+        } else if let Some(ref mut current_policy_instance) = managing_policy.current_child.policy {
+            current_policy_instance.work(&mut wrapped_channel_controller);
+            drop(managing_policy);
+            self.resolve_child_controller(&mut wrapped_channel_controller, ChildKind::Current);
+        } else {
+            drop(managing_policy);
         }
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        if let Some(ref mut pending_policy) = *self.pending_policy.lock().unwrap() {
-            pending_policy.exit_idle(channel_controller);
-        } else if let Some(ref mut current_policy) = *self.current_policy.lock().unwrap() {
-            current_policy.exit_idle(channel_controller);
+        let mut managing_policy = self.managing_policy.lock().unwrap();
+        let mut wrapped_channel_controller = WrappedController::new(channel_controller);
+        // Check if there's a pending policy and call its exit_idle method.
+        // If not, check the current policy.
+        if let Some(ref mut pending_policy_instance) = managing_policy.pending_child.policy {
+            pending_policy_instance.exit_idle(&mut wrapped_channel_controller);
+            drop(managing_policy);
+            self.resolve_child_controller(&mut wrapped_channel_controller, ChildKind::Pending);
+        } else if let Some(ref mut current_policy_instance) = managing_policy.current_child.policy {
+            current_policy_instance.exit_idle(&mut wrapped_channel_controller);
+            drop(managing_policy);
+            self.resolve_child_controller(&mut wrapped_channel_controller, ChildKind::Current);
+        } else {
+            drop(managing_policy);
         }
     }
 }
@@ -302,15 +235,9 @@ impl GracefulSwitchPolicy {
         work_scheduler: Arc<dyn WorkScheduler>,
     ) -> Self {
         GracefulSwitchPolicy { 
-            // mutex: Mutex<Arc<dyn LbPolicy>>,
-            // current_mutex: Mutex<Arc<dyn LbPolicy>>,
-            current_policy_builder: Mutex::default(),
-            pending_policy_builder: Mutex::default(),
+            
             subchannel_to_policy: HashMap::default(),
-            current_policy: Mutex::default(),
-            pending_policy: Mutex::default(),
-            current_policy_state: Mutex::new(None), 
-            pending_policy_state: Mutex::new(None),
+            managing_policy: Mutex::new(LatestPolicy::new()),
             closed: false,
             work_scheduler: work_scheduler,
             pending: false,
@@ -322,40 +249,48 @@ impl GracefulSwitchPolicy {
         channel_controller: &mut WrappedController,        
         child_kind: ChildKind,
     ) {
-        // Add all created subchannels into the subchannel_child_map.
+        let mut should_swap = false;
+        let balancer_wrapper = self.managing_policy.lock().unwrap();
+        match (balancer_wrapper.current_child.policy_state, balancer_wrapper.pending_child.policy_state) {
+            (Some(curr), Some(pend)) => {
+                if curr != ConnectivityState::Ready || pend != ConnectivityState::Connecting {
+                    println!("should swap");
+                    should_swap = true;
+                }
+            }
+        _ => {
+            should_swap = false;
+        }
+        }
+
+        if should_swap {
+            drop(balancer_wrapper); 
+            self.swap(channel_controller);
+        }
+
         for csc in channel_controller.created_subchannels.clone() {
             let key = WeakSubchannel::new(csc.clone());
             if !self.subchannel_to_policy.contains_key(&key) {
-                // println!("inserting subchannel {} into child_id {}", csc, child);
                 self.subchannel_to_policy.insert(key, child_kind.clone());
-                // }
             }
         }
     }
 
-    fn swap(&mut self){
-        let mut current_policy = self.current_policy.lock().unwrap();
-        let mut pending_policy = self.pending_policy.lock().unwrap();
-
+    fn swap(&mut self, channel_controller: &mut WrappedController){
+        let mut managing_policy = self.managing_policy.lock().unwrap();
+        managing_policy.current_child.policy = managing_policy.pending_child.policy.take();
+        managing_policy.current_child.policy_builder = managing_policy.pending_child.policy_builder.take();
+        managing_policy.current_child.policy_state = managing_policy.pending_child.policy_state.take();
         self.subchannel_to_policy.retain(|_, v| *v != ChildKind::Current);
-        // HashMap<WeakSubchannel, ChildKind>
-        let mut new_map: HashMap<WeakSubchannel, ChildKind> = HashMap::new();
-        // self.subchannel_to_policy.clear();
-        // for v in self.subchannel_to_policy.values_mut() {
-        //     if *v == ChildKind::Pending {
-        //         WeakSubchannel::new(self.subchannel_to_policy.get(clone());
-        //         new_map.insert();
-        //     }
-        // }
-        // self.current_policy = Mutex::new(current_policy);
-        *current_policy = pending_policy.take();
-        *self.current_policy_state.lock().unwrap() = self.pending_policy_state.lock().unwrap().take();
+        managing_policy.pending_child.policy = None;
+        managing_policy.pending_child.policy_builder = None;
+        managing_policy.pending_child.policy_state = None;
+        if let Some(picker) = managing_policy.pending_child.policy_picker_update.clone(){
+            channel_controller.channel_controller.update_picker(picker);
+        }
         
-        let mut pending_policy_builder = self.pending_policy_builder.lock().unwrap();
-        let mut current_policy_builder = self.current_policy_builder.lock().unwrap();
-        *current_policy_builder = pending_policy_builder.take();
-        *pending_policy_builder = None;
-        
+        managing_policy.pending_child.policy_picker_update = None;
+     
     }
 
     fn parse_config(
@@ -405,12 +340,9 @@ impl GracefulSwitchPolicy {
         }
         Ok(None)
     }
-    //how do i set pending child to the child from parse_config?
 
     fn switch_to (&mut self, 
-        update: ResolverUpdate,
-        config: Option<&LbConfig>,
-        latest_balancer_kind: ChildKind) -> ChildKind {
+        config: Option<&LbConfig>) -> ChildKind {
         let cfg: Arc<GracefulSwitchLbConfig> = match config.unwrap().convert_to::<Arc<GracefulSwitchLbConfig>>() {
             Ok(cfg) => (*cfg).clone(),
             Err(e) => panic!("convert_to failed: {e}"),
@@ -418,31 +350,21 @@ impl GracefulSwitchPolicy {
         let child_builder = cfg.child_builder.clone();
         let options = LbPolicyOptions { work_scheduler: self.work_scheduler.clone() }; 
         let pending_policy = child_builder.build(options);
-        if self.current_policy.lock().unwrap().is_none(){
-            *self.current_policy.lock().unwrap() = Some(pending_policy);
-            *self.current_policy_builder.lock().unwrap() = Some(child_builder);
-            *self.current_policy_state.lock().unwrap() = Some(ConnectivityState::Connecting);
+        let mut balancer_wrapper = self.managing_policy.lock().unwrap();
+        if balancer_wrapper.current_child.no_policy(){
+            println!("no policy");
+            let new_current_child = ChildPolicy::new(Some(child_builder), Some(pending_policy), Some(ConnectivityState::Connecting));
+            balancer_wrapper.current_child = new_current_child;
             return ChildKind::Current
         }
         else {
-            *self.pending_policy.lock().unwrap() = Some(pending_policy);
-            *self.pending_policy_builder.lock().unwrap() = Some(child_builder);
-            *self.pending_policy_state.lock().unwrap() = Some(ConnectivityState::Connecting);
+            let new_pending_child = ChildPolicy::new(Some(child_builder), Some(pending_policy), Some(ConnectivityState::Connecting));
+            balancer_wrapper.pending_child = new_pending_child;
             return ChildKind::Pending
-
-            
         }
     }
 
-    fn latest_balancer (&mut self) -> ChildKind{
-        if !self.pending_policy.lock().unwrap().is_none(){
-            println!("returning pending child kid as latest");
-            return ChildKind::Pending
-        }
-        println!("returning current child kind as latest");
-        return ChildKind::Current
 
-    }
 }
 
 // Struct to wrap a channel controller around. The purpose is to
@@ -477,7 +399,7 @@ impl ChannelController for WrappedController<'_> {
 
     fn update_picker(&mut self, update: LbState) {
         let update_clone = update.clone();
-        self.channel_controller.update_picker(update);
+        // self.channel_controller.update_picker(update);
         self.picker_update = Some(update_clone);
     }
 
@@ -487,4 +409,73 @@ impl ChannelController for WrappedController<'_> {
 }
 
 
+struct ChildPolicy {
+    policy_builder: Option<Arc<dyn LbPolicyBuilder>>,
+    // subchannel_to_policy: HashMap<WeakSubchannel, ChildKind>,
+    policy: Option<Box<dyn LbPolicy>>,
+    policy_state: Option<ConnectivityState>,
+    policy_picker_update: Option<LbState>,
+}
 
+impl ChildPolicy {
+    fn new(policy_builder: Option<Arc<dyn LbPolicyBuilder>>, policy: Option<Box<dyn LbPolicy>>, policy_state: Option<ConnectivityState>) -> Self {
+        ChildPolicy {
+            policy_builder,
+            policy,
+            policy_state,
+            policy_picker_update: None
+        }
+    }
+
+}
+
+struct LatestPolicy {
+    current_child: ChildPolicy,
+    pending_child: ChildPolicy,
+}
+
+impl LatestPolicy {
+    fn new() -> Self {
+        LatestPolicy {
+            current_child: ChildPolicy::new(None, None, None),
+            pending_child: ChildPolicy::new(None, None, None),
+        }
+    }
+    
+    fn latest_balancer (&mut self) -> (Option<ChildKind>, String) {
+        if !self.pending_child.no_policy(){
+            return (Some(ChildKind::Pending), self.pending_child.policy_builder.clone().unwrap().name().to_string())
+        } else if !self.current_child.no_policy(){
+            return (Some(ChildKind::Current), self.current_child.policy_builder.clone().unwrap().name().to_string())
+        } else{
+            return (None, "".to_string());
+        }
+    }
+
+    fn latest_balancer_name (&mut self) -> String {
+        if !self.pending_child.no_policy(){
+            return self.pending_child.policy_builder.clone().unwrap().name().to_string()
+        } else if !self.current_child.no_policy(){
+            return self.current_child.policy_builder.clone().unwrap().name().to_string()
+        } else{
+            return "".to_string();
+        }
+    }
+
+
+    fn no_policy (&mut self) -> bool {
+        if self.pending_child.no_policy() && self.current_child.no_policy(){ 
+            return true
+        }
+        return false
+    }
+
+  
+}
+
+impl ChildPolicy {
+    fn no_policy (&mut self) -> bool{
+        println!("calling no policy");
+        return self.policy.is_none()
+    }
+}

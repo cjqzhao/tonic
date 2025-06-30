@@ -226,7 +226,6 @@ impl LbPolicy for WrapperPickFirstPolicy {
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
         let mut wrapped_channel_controller = WrappedController::new(channel_controller);
-    
         self.pick_first.work(&mut wrapped_channel_controller);
     }
 

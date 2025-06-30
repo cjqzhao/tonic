@@ -92,12 +92,12 @@ impl ParsedJsonLbConfig {
 
 /// An LB policy factory that produces LbPolicy instances used by the channel
 /// to manage connections and pick connections for RPCs.
-pub trait LbPolicyBuilder: Send + Sync {
+pub trait LbPolicyBuilder: Send + Sync  {
     /// Builds and returns a new LB policy instance.
     ///
     /// Note that build must not fail.  Any optional configuration is delivered
     /// via the LbPolicy's resolver_update method.
-    ///
+    //
     /// An LbPolicy instance is assumed to begin in a Connecting state that
     /// queues RPCs until its first update.
     fn build(&self, options: LbPolicyOptions) -> Box<dyn LbPolicy>;
