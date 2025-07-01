@@ -29,21 +29,43 @@
 // policy in use.  Complete tests must be written before it can be used in
 // production.  Also, support for the work scheduler is missing.
 
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::sync::Mutex;
 use std::{collections::HashMap, error::Error, hash::Hash, mem, sync::Arc};
 
 use crate::client::load_balancing::{
-    ChannelController, LbConfig, LbPolicy, LbPolicyBuilder, LbPolicyOptions, LbState, WorkScheduler,
+    ChannelController, ExternalSubchannel, Failing, LbConfig, LbPolicy, LbPolicyBuilder,
+    LbPolicyOptions, LbState, ParsedJsonLbConfig, PickResult, Picker, QueuingPicker,
+    Subchannel, SubchannelState, WeakSubchannel, WorkScheduler, GLOBAL_LB_REGISTRY, ConnectivityState,
 };
 use crate::client::name_resolution::{Address, ResolverUpdate};
+use crate::service::{Message, Request, Response, Service};
 
-use super::{Subchannel, SubchannelState};
+use tonic::{metadata::MetadataMap, Status};
+
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::{AbortHandle, JoinHandle};
 
 // An LbPolicy implementation that manages multiple children.
 pub struct ChildManager<T> {
     subchannel_child_map: HashMap<Subchannel, usize>,
     children: Vec<Child<T>>,
-    shard_update: Box<ResolverUpdateSharder<T>>,
+    update_sharder: Box<dyn ResolverUpdateSharder<T>>,
+    pending_work: Arc<Mutex<HashSet<usize>>>,
+    updated: bool, // true iff a child has updated its state since the last call to has_updated.
+    // work_requests: Arc<Mutex<HashSet<Arc<T>>>>,
+    // work_scheduler: Arc<dyn WorkScheduler>,
+    sent_connecting_state: bool,
+    aggregated_state: ConnectivityState,
+    last_ready_pickers: Vec<Arc<dyn Picker>>,
+    
 }
+
+use std::{sync::{atomic::{AtomicUsize, Ordering}}};
+
+pub trait ChildIdentifier: PartialEq + Hash + Eq + Send + Sync + Display + 'static {}
+
 
 struct Child<T> {
     identifier: T,
@@ -57,7 +79,7 @@ pub struct ChildUpdate<T> {
     pub child_identifier: T,
     /// The builder the ChildManager should use to create this child if it does
     /// not exist.
-    pub child_policy_builder: Box<dyn LbPolicyBuilder>,
+    pub child_policy_builder: Arc<dyn LbPolicyBuilder>,
     /// The relevant ResolverUpdate to send to this child.
     pub child_update: ResolverUpdate,
 }
@@ -74,11 +96,18 @@ pub type ResolverUpdateSharder<T> =
 impl<T: PartialEq + Hash + Eq> ChildManager<T> {
     /// Creates a new ChildManager LB policy.  shard_update is called whenever a
     /// resolver_update operation occurs.
-    pub fn new(shard_update: Box<ResolverUpdateSharder<T>>) -> Self {
-        Self {
-            subchannel_child_map: HashMap::default(),
-            children: Vec::default(),
-            shard_update,
+    pub fn new(
+        update_sharder: Box<dyn ResolverUpdateSharder<T>>
+    ) -> Self {
+        ChildManager {
+            update_sharder,
+            subchannel_child_map: Default::default(),
+            children: Default::default(),
+            pending_work: Default::default(),
+            updated: false,
+            sent_connecting_state: false,
+            aggregated_state: ConnectivityState::Idle,
+            last_ready_pickers: Vec::new(),
         }
     }
 
@@ -88,6 +117,12 @@ impl<T: PartialEq + Hash + Eq> ChildManager<T> {
             .iter()
             .map(|child| (&child.identifier, &child.state))
     }
+    
+    pub fn has_updated(&mut self) -> bool {
+        mem::take(&mut self.updated)
+    }
+
+
 
     // Called to update all accounting in the ChildManager from operations
     // performed by a child policy on the WrappedController that was created for
@@ -98,21 +133,22 @@ impl<T: PartialEq + Hash + Eq> ChildManager<T> {
     // which way is better.
     fn resolve_child_controller(
         &mut self,
-        channel_controller: WrappedController,
+        channel_controller: &mut WrappedController,        
         child_idx: usize,
     ) {
         // Add all created subchannels into the subchannel_child_map.
-        for csc in channel_controller.created_subchannels {
-            self.subchannel_child_map.insert(csc, child_idx);
+        for csc in channel_controller.created_subchannels.clone() {
+            self.subchannel_child_map.insert(csc.into(), child_idx);
         }
         // Update the tracked state if the child produced an update.
-        if let Some(state) = channel_controller.picker_update {
-            self.children[child_idx].state = state;
+        if let Some(state) = &channel_controller.picker_update {
+            self.children[child_idx].state = state.clone();
+            self.updated = true;
         };
     }
 }
 
-impl<T: PartialEq + Hash + Eq + Send> LbPolicy for ChildManager<T> {
+impl<T: ChildIdentifier> LbPolicy for ChildManager<T> {
     fn resolver_update(
         &mut self,
         resolver_update: ResolverUpdate,
@@ -195,10 +231,11 @@ impl<T: PartialEq + Hash + Eq + Send> LbPolicy for ChildManager<T> {
             let _ = child
                 .policy
                 .resolver_update(child_update, config, &mut channel_controller);
-            self.resolve_child_controller(channel_controller, child_idx);
+            self.resolve_child_controller(&mut channel_controller, child_idx);
         }
         Ok(())
     }
+    
 
     fn subchannel_update(
         &mut self,
@@ -213,11 +250,27 @@ impl<T: PartialEq + Hash + Eq + Send> LbPolicy for ChildManager<T> {
         let mut channel_controller = WrappedController::new(channel_controller);
         // Call the proper child.
         policy.subchannel_update(subchannel, state, &mut channel_controller);
-        self.resolve_child_controller(channel_controller, child_idx);
+        self.resolve_child_controller(&mut channel_controller, child_idx);
     }
 
-    fn work(&mut self, _channel_controller: &mut dyn ChannelController) {
-        todo!();
+    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+        let child_idxes = mem::take(&mut *self.pending_work.lock().unwrap());
+        for child_idx in child_idxes {
+            let mut channel_controller = WrappedController::new(channel_controller);
+            self.children[child_idx]
+                .policy
+                .work(&mut channel_controller);
+            self.resolve_child_controller(&mut channel_controller, child_idx);
+        }
+    }
+    
+    fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+        todo!()
+        // let policy = &mut self.children.get_mut(&child_id.clone()).unwrap().policy;
+        // let mut channel_controller = WrappedController::new(channel_controller);
+        // // Call the proper child.
+        // policy.exit_idle(&mut channel_controller);
+        // self.resolve_child_controller(channel_controller, child_id.clone());
     }
 }
 
@@ -225,6 +278,7 @@ struct WrappedController<'a> {
     channel_controller: &'a mut dyn ChannelController,
     created_subchannels: Vec<Subchannel>,
     picker_update: Option<LbState>,
+    need_to_reach: bool,
 }
 
 impl<'a> WrappedController<'a> {
@@ -233,7 +287,12 @@ impl<'a> WrappedController<'a> {
             channel_controller,
             created_subchannels: vec![],
             picker_update: None,
+            need_to_reach: false,
         }
+    }
+
+    fn need_to_reach(&mut self) {
+        self.need_to_reach = true;
     }
 }
 
@@ -245,8 +304,12 @@ impl ChannelController for WrappedController<'_> {
     }
 
     fn update_picker(&mut self, update: LbState) {
-        self.picker_update = Some(update);
-    }
+            self.picker_update = Some(update.clone());
+            if self.need_to_reach{
+                self.channel_controller.update_picker(update);
+                self.need_to_reach = false;
+            }
+        }
 
     fn request_resolution(&mut self) {
         self.channel_controller.request_resolution();
@@ -257,6 +320,9 @@ pub struct UnimplWorkScheduler;
 
 impl WorkScheduler for UnimplWorkScheduler {
     fn schedule_work(&self) {
-        todo!();
+        let mut pending_work = self.pending_work.lock().unwrap();
+        if let Some(idx) = *self.idx.lock().unwrap() {
+            pending_work.insert(idx);
+        }
     }
 }
