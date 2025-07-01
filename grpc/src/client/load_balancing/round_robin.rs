@@ -52,7 +52,7 @@ impl LbPolicyBuilder for RoundRobinBuilder {
     fn build(&self, options: LbPolicyOptions) -> Box<dyn LbPolicy> {
         super::GLOBAL_LB_REGISTRY.add_builder(WrappedPickFirstBuilder {});
         let resolver_update_sharder = ResolverUpdateSharderStruct {builder:GLOBAL_LB_REGISTRY.get_policy("wrapped_pick_first").unwrap()};
-        let lb_policy = Box::new(ChildManager::<Endpoint>::new(options.work_scheduler.clone(), Box::new(resolver_update_sharder)));
+        let lb_policy = Box::new(ChildManager::<Endpoint>::new(Box::new(resolver_update_sharder)));
         Box::new(RoundRobinPolicy {
             child_manager: lb_policy,
             work_scheduler: options.work_scheduler,
@@ -226,6 +226,7 @@ impl LbPolicy for WrapperPickFirstPolicy {
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
         let mut wrapped_channel_controller = WrappedController::new(channel_controller);
+    
         self.pick_first.work(&mut wrapped_channel_controller);
     }
 
@@ -279,20 +280,26 @@ impl ResolverUpdateSharder<Endpoint> for ResolverUpdateSharderStruct {
     fn shard_update(
         &self,
         resolver_update: ResolverUpdate,
-       
-    ) -> Result<HashMap<Endpoint, ChildUpdate>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Box<dyn Iterator<Item = ChildUpdate<Endpoint>>>, Box<dyn Error + Send + Sync>> {
         let mut hashmap = HashMap::new();
         let builder = self.builder.clone();
         for endpoint in resolver_update.endpoints.clone().unwrap().iter() {
             println!("endpoint assigned to a child is {}", endpoint);
+            let endpoint_owned = endpoint.clone();
             let child_update = ChildUpdate{
+                child_identifier: endpoint_owned.clone(),
                 child_policy_builder: self.builder.clone(),
                 //create new resolver update with particular endpoint
-                child_update: ResolverUpdate {attributes: resolver_update.attributes.clone(), endpoints: Ok(vec![endpoint.clone()]), service_config: resolver_update.service_config.clone(), resolution_note: resolver_update.resolution_note.clone()},
+                child_update: ResolverUpdate {
+                    attributes: resolver_update.attributes.clone(),
+                    endpoints: Ok(vec![endpoint_owned.clone()]),
+                    service_config: resolver_update.service_config.clone(),
+                    resolution_note: resolver_update.resolution_note.clone()
+                },
             };
-            hashmap.insert(endpoint.clone(), child_update);
+            hashmap.insert(endpoint_owned, child_update);
         }
-        Ok(hashmap)
+        Ok(Box::new(hashmap.into_values()))
     }
 }
 
@@ -376,4 +383,3 @@ impl LbPolicy for RoundRobinPolicy {
 
     }
 }
-
