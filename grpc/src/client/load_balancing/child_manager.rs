@@ -213,6 +213,15 @@ impl<T: PartialEq + Hash + Eq + Send> LbPolicy for ChildManager<T> {
     fn work(&mut self, _channel_controller: &mut dyn ChannelController) {
         todo!();
     }
+    
+    fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+        todo!()
+        // let policy = &mut self.children.get_mut(&child_id.clone()).unwrap().policy;
+        // let mut channel_controller = WrappedController::new(channel_controller);
+        // // Call the proper child.
+        // policy.exit_idle(&mut channel_controller);
+        // self.resolve_child_controller(channel_controller, child_id.clone());
+    }
 }
 
 struct WrappedController<'a> {

@@ -23,6 +23,10 @@
 //! a service.
 use core::fmt;
 
+use super::service_config::{self, ServiceConfig};
+use crate::{attributes::Attributes, rt};
+
+use super::load_balancing::child_manager::ChildIdentifier;
 use std::{
     error::Error,
     fmt::{Display, Formatter},
