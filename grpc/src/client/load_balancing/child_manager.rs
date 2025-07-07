@@ -219,6 +219,10 @@ impl<T: PartialEq + Hash + Eq + Send> LbPolicy for ChildManager<T> {
     fn work(&mut self, _channel_controller: &mut dyn ChannelController) {
         todo!();
     }
+
+    fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+        // TODO(cjzhao): add exit idle logic once everything has been merged in
+    }
 }
 
 struct WrappedController<'a> {
