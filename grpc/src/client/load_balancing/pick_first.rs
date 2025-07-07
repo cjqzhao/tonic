@@ -10,9 +10,9 @@ use std::{
 use crate::{
     client::{
         load_balancing::{
-            ChannelController, Failing, LbPolicy, LbPolicyBuilder, LbPolicyOptions, LbState,
-            ParsedJsonLbConfig, Pick, PickResult, Picker, QueuingPicker, Subchannel,
-            ExternalSubchannel, SubchannelState, WorkScheduler,
+            ChannelController, ExternalSubchannel, Failing, LbPolicy, LbPolicyBuilder,
+            LbPolicyOptions, LbState, ParsedJsonLbConfig, Pick, PickResult, Picker, QueuingPicker,
+            Subchannel, SubchannelState, WorkScheduler,
         },
         name_resolution::{Address, Endpoint, ResolverUpdate},
         service_config::LbConfig,
