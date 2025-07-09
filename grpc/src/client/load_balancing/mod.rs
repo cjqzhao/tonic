@@ -145,7 +145,7 @@ pub trait LbPolicy: Send {
     fn work(&mut self, channel_controller: &mut dyn ChannelController);
 
     /// Called by the channel when a LbPolicy goes Idle and the channel
-    /// wants it to start connecting to subchannels again.
+    /// wants it to start connecting to subchannels .
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController);
 }
 
