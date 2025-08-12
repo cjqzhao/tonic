@@ -41,10 +41,9 @@ use std::{fmt::Debug, ops::Add, sync::Arc};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::AbortHandle;
-use tonic::metadata::MetadataMap;
 
-#[derive(Debug)]
 pub(crate) struct EmptyMessage {}
+impl Message for EmptyMessage {}
 pub(crate) fn new_request() -> Request {
     Request::new(Box::pin(tokio_stream::once(
         Box::new(EmptyMessage {}) as Box<dyn Message>
@@ -112,7 +111,7 @@ impl Debug for TestEvent {
             Self::NewSubchannel(sc) => write!(f, "NewSubchannel({})", sc.address()),
             Self::UpdatePicker(state) => write!(f, "UpdatePicker({})", state.connectivity_state),
             Self::RequestResolution => write!(f, "RequestResolution"),
-            Self::Connect(addr) => write!(f, "Connect({:?})", addr.address),
+            Self::Connect(addr) => write!(f, "Connect({})", addr.address.to_string()),
             Self::ScheduleWork => write!(f, "ScheduleWork"),
         }
     }
